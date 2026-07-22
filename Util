@@ -1,52 +1,4 @@
 /**
- * 自動対象年月設定。
- *
- * autoTargetMonth=true の場合：
- * 実行日の翌月を対象として、
- * targetYear / targetMonth / targetSheetName / sourceSheetName を自動設定する。
- */
-function elShiftApplyAutoTargetMonth_() {
-  if (!EL_SHIFT_CONFIG.autoTargetMonth) {
-    Logger.log(
-      `AUTO TARGET MONTH: disabled. ` +
-      `targetYear=${EL_SHIFT_CONFIG.targetYear}, ` +
-      `targetMonth=${EL_SHIFT_CONFIG.targetMonth}, ` +
-      `targetSheetName=${EL_SHIFT_CONFIG.targetSheetName}, ` +
-      `sourceSheetName=${EL_SHIFT_CONFIG.sourceSheetName}`
-    );
-    return;
-  }
-
-  const today = new Date();
-  const offset = Number(EL_SHIFT_CONFIG.autoTargetMonthOffset || 0);
-
-  const targetDate = new Date(
-    today.getFullYear(),
-    today.getMonth() + offset,
-    1
-  );
-
-  const targetYear = targetDate.getFullYear();
-  const targetMonth = targetDate.getMonth() + 1;
-
-  EL_SHIFT_CONFIG.targetYear = targetYear;
-  EL_SHIFT_CONFIG.targetMonth = targetMonth;
-  EL_SHIFT_CONFIG.targetSheetName =
-    `${targetYear}${String(targetMonth).padStart(2, '0')}`;
-  EL_SHIFT_CONFIG.sourceSheetName =
-    `${targetYear}年${targetMonth}月`;
-
-  Logger.log(
-    `AUTO TARGET MONTH: enabled. ` +
-    `today=${elShiftDateKey_(today.getFullYear(), today.getMonth() + 1, today.getDate())}, ` +
-    `targetYear=${EL_SHIFT_CONFIG.targetYear}, ` +
-    `targetMonth=${EL_SHIFT_CONFIG.targetMonth}, ` +
-    `targetSheetName=${EL_SHIFT_CONFIG.targetSheetName}, ` +
-    `sourceSheetName=${EL_SHIFT_CONFIG.sourceSheetName}`
-  );
-}
-
-/**
  * 指定日が、その月の最終営業日かどうかを判定する。
  */
 function elShiftIsLastBusinessDay_(date) {
@@ -93,7 +45,7 @@ function elShiftGetLastBusinessDayOfMonth_(year, month) {
  * 営業日：
  * - 土曜ではない
  * - 日曜ではない
- * - 日本の祝日ではない
+ * - 休日データ Sheet に登録されている日付ではない
  */
 function elShiftIsBusinessDay_(date) {
   const day = date.getDay();
@@ -103,7 +55,7 @@ function elShiftIsBusinessDay_(date) {
     return false;
   }
 
-  if (elShiftIsJapaneseHoliday_(date)) {
+  if (elShiftIsHolidayFromSheet_(date)) {
     return false;
   }
 
@@ -111,21 +63,101 @@ function elShiftIsBusinessDay_(date) {
 }
 
 /**
- * 日本祝日判定。
+ * 休日データ Sheet を参照して祝日・会社休日を判定する。
+ *
+ * 対応できる形式：
+ * - 2026/07/20
+ * - 2026-07-20
+ * - Date型の日付セル
+ *
+ * Sheet内のどの列に日付があっても拾えるように、
+ * 全セルを走査して日付らしい値を判定する。
  */
-function elShiftIsJapaneseHoliday_(date) {
-  const calendarId = EL_SHIFT_CONFIG.japaneseHolidayCalendarId;
-  const calendar = CalendarApp.getCalendarById(calendarId);
+function elShiftIsHolidayFromSheet_(date) {
+  const holidayDateSet = elShiftGetHolidayDateSet_();
 
-  if (!calendar) {
-    throw new Error(
-      `Japanese holiday calendar not found. calendarId=${calendarId}`
+  const dateKey = elShiftDateKey_(
+    date.getFullYear(),
+    date.getMonth() + 1,
+    date.getDate()
+  );
+
+  return !!holidayDateSet[dateKey];
+}
+
+/**
+ * 休日データ Sheet から休日一覧を取得する。
+ *
+ * Sheet名：休日データ
+ */
+function elShiftGetHolidayDateSet_() {
+  const spreadsheet = elShiftOpenSpreadsheet_(
+    EL_SHIFT_CONFIG.settingSpreadsheetId ||
+    EL_SHIFT_CONFIG.targetSpreadsheetId ||
+    ''
+  );
+
+  const sheet = spreadsheet.getSheetByName('休日データ');
+
+  if (!sheet) {
+    throw new Error('Sheet not found: 休日データ');
+  }
+
+  const values = sheet.getDataRange().getValues();
+  const result = {};
+
+  values.forEach((row) => {
+    row.forEach((cell) => {
+      const dateKey = elShiftParseHolidayDateKey_(cell);
+
+      if (dateKey) {
+        result[dateKey] = true;
+      }
+    });
+  });
+
+  Logger.log(
+    `HOLIDAY DATA LOADED: ${Object.keys(result).length} dates from 休日データ`
+  );
+
+  return result;
+}
+
+/**
+ * 休日データ Sheet のセル値を yyyy-mm-dd に変換する。
+ */
+function elShiftParseHolidayDateKey_(value) {
+  if (value instanceof Date && !isNaN(value.getTime())) {
+    return elShiftDateKey_(
+      value.getFullYear(),
+      value.getMonth() + 1,
+      value.getDate()
     );
   }
 
-  const events = calendar.getEventsForDay(date);
+  const text = elShiftDisplayText_(value);
 
-  return events.length > 0;
+  if (!text) return '';
+
+  let match = text.match(/^(\d{4})[\/\-](\d{1,2})[\/\-](\d{1,2})$/);
+  if (match) {
+    return elShiftDateKey_(
+      Number(match[1]),
+      Number(match[2]),
+      Number(match[3])
+    );
+  }
+
+  match = text.match(/^(\d{4})年(\d{1,2})月(\d{1,2})日$/);
+  if (match) {
+    return elShiftDateKey_(
+      Number(match[1]),
+      Number(match[2]),
+      Number(match[3])
+    );
+  }
+
+  return '';
 }
 
 /**
@@ -151,6 +183,10 @@ function debugLastBusinessDay() {
 
   Logger.log(
     `${year}年${month}月の最終営業日: ` +
-    elShiftDateKey_(date.getFullYear(), date.getMonth() + 1, date.getDate())
+      elShiftDateKey_(
+        date.getFullYear(),
+        date.getMonth() + 1,
+        date.getDate()
+      )
   );
 }
