@@ -1,0 +1,156 @@
+/**
+ * 自動対象年月設定。
+ *
+ * autoTargetMonth=true の場合：
+ * 実行日の翌月を対象として、
+ * targetYear / targetMonth / targetSheetName / sourceSheetName を自動設定する。
+ */
+function elShiftApplyAutoTargetMonth_() {
+  if (!EL_SHIFT_CONFIG.autoTargetMonth) {
+    Logger.log(
+      `AUTO TARGET MONTH: disabled. ` +
+      `targetYear=${EL_SHIFT_CONFIG.targetYear}, ` +
+      `targetMonth=${EL_SHIFT_CONFIG.targetMonth}, ` +
+      `targetSheetName=${EL_SHIFT_CONFIG.targetSheetName}, ` +
+      `sourceSheetName=${EL_SHIFT_CONFIG.sourceSheetName}`
+    );
+    return;
+  }
+
+  const today = new Date();
+  const offset = Number(EL_SHIFT_CONFIG.autoTargetMonthOffset || 0);
+
+  const targetDate = new Date(
+    today.getFullYear(),
+    today.getMonth() + offset,
+    1
+  );
+
+  const targetYear = targetDate.getFullYear();
+  const targetMonth = targetDate.getMonth() + 1;
+
+  EL_SHIFT_CONFIG.targetYear = targetYear;
+  EL_SHIFT_CONFIG.targetMonth = targetMonth;
+  EL_SHIFT_CONFIG.targetSheetName =
+    `${targetYear}${String(targetMonth).padStart(2, '0')}`;
+  EL_SHIFT_CONFIG.sourceSheetName =
+    `${targetYear}年${targetMonth}月`;
+
+  Logger.log(
+    `AUTO TARGET MONTH: enabled. ` +
+    `today=${elShiftDateKey_(today.getFullYear(), today.getMonth() + 1, today.getDate())}, ` +
+    `targetYear=${EL_SHIFT_CONFIG.targetYear}, ` +
+    `targetMonth=${EL_SHIFT_CONFIG.targetMonth}, ` +
+    `targetSheetName=${EL_SHIFT_CONFIG.targetSheetName}, ` +
+    `sourceSheetName=${EL_SHIFT_CONFIG.sourceSheetName}`
+  );
+}
+
+/**
+ * 指定日が、その月の最終営業日かどうかを判定する。
+ */
+function elShiftIsLastBusinessDay_(date) {
+  const targetDateKey = elShiftDateKey_(
+    date.getFullYear(),
+    date.getMonth() + 1,
+    date.getDate()
+  );
+
+  const lastBusinessDay = elShiftGetLastBusinessDayOfMonth_(
+    date.getFullYear(),
+    date.getMonth() + 1
+  );
+
+  const lastBusinessDayKey = elShiftDateKey_(
+    lastBusinessDay.getFullYear(),
+    lastBusinessDay.getMonth() + 1,
+    lastBusinessDay.getDate()
+  );
+
+  Logger.log(
+    `LAST BUSINESS DAY CHECK: today=${targetDateKey}, lastBusinessDay=${lastBusinessDayKey}`
+  );
+
+  return targetDateKey === lastBusinessDayKey;
+}
+
+/**
+ * 指定年月の最終営業日を取得する。
+ */
+function elShiftGetLastBusinessDayOfMonth_(year, month) {
+  let date = new Date(year, month, 0);
+
+  while (!elShiftIsBusinessDay_(date)) {
+    date.setDate(date.getDate() - 1);
+  }
+
+  return date;
+}
+
+/**
+ * 営業日判定。
+ *
+ * 営業日：
+ * - 土曜ではない
+ * - 日曜ではない
+ * - 日本の祝日ではない
+ */
+function elShiftIsBusinessDay_(date) {
+  const day = date.getDay();
+
+  // 0 = Sunday, 6 = Saturday
+  if (day === 0 || day === 6) {
+    return false;
+  }
+
+  if (elShiftIsJapaneseHoliday_(date)) {
+    return false;
+  }
+
+  return true;
+}
+
+/**
+ * 日本祝日判定。
+ */
+function elShiftIsJapaneseHoliday_(date) {
+  const calendarId = EL_SHIFT_CONFIG.japaneseHolidayCalendarId;
+  const calendar = CalendarApp.getCalendarById(calendarId);
+
+  if (!calendar) {
+    throw new Error(
+      `Japanese holiday calendar not found. calendarId=${calendarId}`
+    );
+  }
+
+  const events = calendar.getEventsForDay(date);
+
+  return events.length > 0;
+}
+
+/**
+ * ログ用日付表示。
+ */
+function elShiftFormatDateForLog_(date) {
+  return elShiftDateKey_(
+    date.getFullYear(),
+    date.getMonth() + 1,
+    date.getDate()
+  );
+}
+
+/**
+ * 最終営業日の判定確認用。
+ * 必要に応じて year / month を書き換えて実行してください。
+ */
+function debugLastBusinessDay() {
+  const year = 2026;
+  const month = 7;
+
+  const date = elShiftGetLastBusinessDayOfMonth_(year, month);
+
+  Logger.log(
+    `${year}年${month}月の最終営業日: ` +
+    elShiftDateKey_(date.getFullYear(), date.getMonth() + 1, date.getDate())
+  );
+}
