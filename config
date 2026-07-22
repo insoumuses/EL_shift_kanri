@@ -1,0 +1,18 @@
+  // ===== 自動対象年月設定 =====
+  // true の場合、実行日の翌月を対象月として自動判定する。
+  autoTargetMonth: true,
+
+  // 0 = 実行月、1 = 翌月
+  // 毎月最終営業日に翌月分を反映する想定なので 1。
+  autoTargetMonthOffset: 1,
+
+  // 日本祝日判定用。
+  japaneseHolidayCalendarId: 'ja.japanese#holiday@group.v.calendar.google.com',
+
+  // 毎日チェックする時間帯。
+  // 実際に反映されるのは最終営業日のみ。
+  triggerHour: 10,
+
+function runElShiftSync() {
+  elShiftApplyAutoTargetMonth_();
+  elShiftValidateMode_();
