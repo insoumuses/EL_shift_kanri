@@ -1,0 +1,23 @@
+function onOpen(e) {
+  SpreadsheetApp.getUi()
+    .createMenu('🔄 ELシフト反映')
+    .addItem('シフトを反映する', 'runElShiftFromMenu')
+    .addToUi();
+}
+
+
+function runElShiftFromMenu() {
+  const ui = SpreadsheetApp.getUi();
+
+  const result = ui.alert(
+    'ELシフト反映',
+    '海外シフト表の内容をEL窓口シフトへ反映します。\n実行しますか？',
+    ui.ButtonSet.YES_NO
+  );
+
+  if (result !== ui.Button.YES) return;
+
+  runElShiftSync();
+
+  ui.alert('ELシフトの反映が完了しました。');
+}
