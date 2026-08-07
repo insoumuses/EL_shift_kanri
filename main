@@ -1,0 +1,739 @@
+const EL_SHIFT_CONFIG = {
+  // Choose the test mode first.
+  // DRY_RUN  = only print logs, do not write cells
+  // TEST_ONE = write only one CW_ID
+  // EXECUTE  = write all matched members
+  mode: 'EXECUTE',
+  // ===== 自動対象年月設定 =====
+  // true の場合、実行日の翌月を対象月として自動判定する。
+  autoTargetMonth: true,
+
+  // 0 = 実行月、1 = 翌月
+  // 毎月最終営業日に翌月分を反映する想定なので 1。
+  autoTargetMonthOffset: 1,
+
+  // 毎日チェックする時間帯。
+  // 実際に反映されるのは最終営業日のみ。
+  triggerHour: 10,
+
+
+  // Used only in DRY_RUN / TEST_ONE.
+  testCwId: '',
+  testDate: '', // Empty string '' means the whole month for one person.
+
+  // Target month
+  targetYear: 2026,
+  targetMonth: 8,
+
+  // 【海外】2026年シフト表v1.0
+  targetSpreadsheetId: '',
+  sourceSpreadsheetId: '1upjFhFqjJw8OE-WXxZhgfnHf8co5Amns12Tz-wDc4WU',
+
+  settingSpreadsheetId: '',
+  memberDataSpreadsheetId: '',
+
+  targetSheetName: '202608',
+  sourceSheetName: '2026年8月',
+  shiftSettingSheetName: '',
+  memberDataSheetName: 'メンバーデータ',
+
+  // Important row / column positions
+  targetDateRow: 7,
+  targetMemberColumn: 1,
+  sourceDateRow: 23,
+  sourceMemberNameColumn: 4,
+
+  // メンバーデータ
+  masterHeaderRow: 1,
+  masterCwIdColumn: 5,
+  masterOverseasNameColumn: 2,
+
+  // シフト設定
+  // If shiftSettingSheetName is blank, these built-in rules are used.
+  // false means 休
+  builtInStatusIsWorking: {
+    A: true,
+    R: true,
+    入社: true,
+    前: true,
+    前R: true,
+    後: true,
+    後R: true,
+    大: true,
+    前大: true,
+    後大: true,
+
+    有: false,
+    特: false,
+    代: false,
+    公休: false,
+    健: false,
+    ワ: false,
+    E: false,
+    前E: false,
+    後E: false,
+
+    // 海外表上で勤務扱いとして出る可能性があるもの。
+    // EL側は空白のままにする。
+    CX部: true,
+    TL: true,
+    STL: true,
+  },
+
+  // A column = user status, C column = working TRUE/FALSE.
+  shiftSettingStatusColumn: 1,
+  shiftSettingWorkingColumn: 3,
+  shiftSettingStartRow: 2,
+
+  // Safety rule.
+  // Only these values may be overwritten in EL窓口シフト.
+  writableValues: ['', '休', '前', '後'],
+
+  // These values are always kept.
+  protectedValues: ['M', 'S'],
+};
+
+//Main function
+
+function runElShiftSync() {
+  elShiftApplyAutoTargetMonth_();
+  elShiftValidateMode_();
+
+  const targetSpreadsheet = elShiftOpenSpreadsheet_(EL_SHIFT_CONFIG.targetSpreadsheetId);
+  const sourceSpreadsheet = elShiftOpenSpreadsheet_(EL_SHIFT_CONFIG.sourceSpreadsheetId);
+  const settingSpreadsheet = elShiftOpenSpreadsheet_(
+    EL_SHIFT_CONFIG.settingSpreadsheetId || EL_SHIFT_CONFIG.sourceSpreadsheetId
+  );
+  const memberDataSpreadsheet = elShiftOpenSpreadsheet_(
+    EL_SHIFT_CONFIG.memberDataSpreadsheetId || EL_SHIFT_CONFIG.sourceSpreadsheetId
+  );
+
+  const targetSheet = elShiftGetSheet_(targetSpreadsheet, EL_SHIFT_CONFIG.targetSheetName);
+  const sourceSheet = elShiftGetSheet_(sourceSpreadsheet, EL_SHIFT_CONFIG.sourceSheetName);
+  const memberDataSheet = elShiftGetSheet_(memberDataSpreadsheet, EL_SHIFT_CONFIG.memberDataSheetName);
+
+  const shiftSettingSheet = EL_SHIFT_CONFIG.shiftSettingSheetName
+    ? elShiftGetSheet_(settingSpreadsheet, EL_SHIFT_CONFIG.shiftSettingSheetName)
+    : null;
+
+  const targetValues = targetSheet.getDataRange().getDisplayValues();
+  const targetFormulas = targetSheet.getDataRange().getFormulas();
+  const sourceValues = sourceSheet.getDataRange().getDisplayValues();
+
+  const statusIsWorking = shiftSettingSheet
+    ? elShiftReadStatusSetting_(shiftSettingSheet)
+    : EL_SHIFT_CONFIG.builtInStatusIsWorking;
+
+  const cwIdToOverseasName = elShiftReadMemberData_(memberDataSheet);
+  const overseasNameToSourceRow = elShiftBuildOverseasNameIndex_(sourceValues);
+
+  elShiftLogDuplicateCwIds_(targetValues, targetFormulas);
+  elShiftLogDuplicateOverseasNames_(sourceValues);
+
+  const targetDateToColumn = elShiftBuildDateIndex_(
+    targetValues,
+    EL_SHIFT_CONFIG.targetDateRow,
+    EL_SHIFT_CONFIG.targetYear,
+    EL_SHIFT_CONFIG.targetMonth
+  );
+
+  const sourceMonth = elShiftParseYearMonth_(EL_SHIFT_CONFIG.sourceSheetName) || {
+    year: EL_SHIFT_CONFIG.targetYear,
+    month: EL_SHIFT_CONFIG.targetMonth,
+  };
+
+  const sourceDateToColumn = elShiftBuildSourceDateIndexAuto_(
+    sourceValues,
+    sourceMonth.year,
+    sourceMonth.month,
+    EL_SHIFT_CONFIG.sourceMemberNameColumn + 1
+  );
+
+  const datesToUpdate = elShiftGetTargetDates_()
+    .filter((dateKey) => elShiftShouldTestThisDate_(dateKey))
+    .map((dateKey) => ({
+      dateKey,
+      targetColumn: targetDateToColumn[dateKey],
+      sourceColumn: sourceDateToColumn[dateKey],
+    }))
+    .filter((dateInfo) => dateInfo.targetColumn && dateInfo.sourceColumn);
+
+  if (datesToUpdate.length === 0) {
+    throw new Error('No matching date columns were found. Please check date rows and sheet names.');
+  }
+
+  Logger.log(
+    `DATES TO UPDATE: ${datesToUpdate
+      .map((d) => `${d.dateKey}: EL ${elShiftColumnToLetter_(d.targetColumn)} / 海外 ${elShiftColumnToLetter_(d.sourceColumn)}`)
+      .join(', ')}`
+  );
+
+  const minTargetColumn = Math.min(...datesToUpdate.map((d) => d.targetColumn));
+  const maxTargetColumn = Math.max(...datesToUpdate.map((d) => d.targetColumn));
+  const rowWidth = maxTargetColumn - minTargetColumn + 1;
+
+  const writableValueSet = elShiftToSet_(EL_SHIFT_CONFIG.writableValues);
+  const protectedValueSet = elShiftToSet_(EL_SHIFT_CONFIG.protectedValues);
+
+  const summary = {
+    updatedMembers: 0,
+    changedCells: 0,
+    skippedProtectedCells: 0,
+    skippedCustomCells: 0,
+    skippedMembers: 0,
+    skippedUnknownStatusCells: 0,
+  };
+
+  for (let rowIndex = 0; rowIndex < targetValues.length; rowIndex++) {
+    const elRowNumber = rowIndex + 1;
+    const elMemberDisplayText = targetValues[rowIndex][EL_SHIFT_CONFIG.targetMemberColumn - 1];
+    const elMemberFormulaText = targetFormulas[rowIndex][EL_SHIFT_CONFIG.targetMemberColumn - 1];
+    const cwId = elShiftExtractCwIdFromElCell_(elMemberDisplayText, elMemberFormulaText);
+
+    if (!cwId) continue;
+    if (!elShiftShouldTestThisMember_(cwId)) continue;
+
+    const overseasName = cwIdToOverseasName[cwId];
+
+    if (!overseasName) {
+      Logger.log(`SKIP: CW_ID not found in メンバーデータ. EL row=${elRowNumber}, CW_ID=${cwId}`);
+      summary.skippedMembers++;
+      continue;
+    }
+
+    const sourceRowNumber = overseasNameToSourceRow[elShiftNormalizeName_(overseasName)];
+
+    if (!sourceRowNumber) {
+      Logger.log(`SKIP: name not found in overseas sheet. EL row=${elRowNumber}, CW_ID=${cwId}, name=${overseasName}`);
+      summary.skippedMembers++;
+      continue;
+    }
+
+    const targetRowRange = targetSheet.getRange(elRowNumber, minTargetColumn, 1, rowWidth);
+    const targetRowValues = targetRowRange.getDisplayValues()[0];
+    let thisMemberChanged = false;
+
+    datesToUpdate.forEach((dateInfo) => {
+      const targetOffset = dateInfo.targetColumn - minTargetColumn;
+
+      const currentElValue = elShiftCleanText_(targetRowValues[targetOffset]);
+      const overseasStatus = elShiftCleanText_(
+        sourceValues[sourceRowNumber - 1][dateInfo.sourceColumn - 1]
+      );
+
+      const convertResult = elShiftConvertStatus_(overseasStatus, statusIsWorking);
+      const nextElValue = convertResult.value;
+
+      const targetCell = `${elShiftColumnToLetter_(dateInfo.targetColumn)}${elRowNumber}`;
+      const sourceCell = `${elShiftColumnToLetter_(dateInfo.sourceColumn)}${sourceRowNumber}`;
+
+      Logger.log(
+        `[${EL_SHIFT_CONFIG.mode}]\n` +
+        `EL行: ${elRowNumber}\n` +
+        `海外表行: ${sourceRowNumber}\n` +
+        `CW_ID: ${cwId}\n` +
+        `EL表示: ${elMemberDisplayText || '(blank)'}\n` +
+        `海外表姓名: ${overseasName}\n` +
+        `日期: ${dateInfo.dateKey.replace(/-/g, '/')}\n` +
+        `海外表セル: ${sourceCell}\n` +
+        `ELセル: ${targetCell}\n` +
+        `海外状態: ${overseasStatus || '(blank)'}\n` +
+        `現在値: ${currentElValue || '(blank)'}\n` +
+        `変換結果: ${nextElValue || '(blank)'}\n` +
+        `判定: ${convertResult.reason}`
+      );
+
+      if (convertResult.unknownStatus) {
+        summary.skippedUnknownStatusCells++;
+      }
+
+      if (protectedValueSet[currentElValue]) {
+        summary.skippedProtectedCells++;
+        return;
+      }
+
+      if (!writableValueSet[currentElValue]) {
+        summary.skippedCustomCells++;
+        return;
+      }
+
+      if (currentElValue !== nextElValue) {
+        targetRowValues[targetOffset] = nextElValue;
+        thisMemberChanged = true;
+        summary.changedCells++;
+      }
+    });
+
+    if (thisMemberChanged) {
+      summary.updatedMembers++;
+
+      if (EL_SHIFT_CONFIG.mode !== 'DRY_RUN') {
+        targetRowRange.setValues([targetRowValues]);
+      }
+    }
+  }
+
+  Logger.log(JSON.stringify(summary, null, 2));
+
+  const message =
+    `完了\n` +
+    `mode=${EL_SHIFT_CONFIG.mode}\n` +
+    `更新人数=${summary.updatedMembers}\n` +
+    `変更セル=${summary.changedCells}\n` +
+    `M/S保護=${summary.skippedProtectedCells}\n` +
+    `手動値スキップ=${summary.skippedCustomCells}\n` +
+    `未定義ステータス=${summary.skippedUnknownStatusCells}\n` +
+    `スキップ人数=${summary.skippedMembers}`;
+
+  Logger.log(message);
+}
+
+/**
+ * Optional debug function.
+ */
+function debugElCwIdRead() {
+  const targetSpreadsheet = elShiftOpenSpreadsheet_(EL_SHIFT_CONFIG.targetSpreadsheetId);
+  const targetSheet = elShiftGetSheet_(targetSpreadsheet, EL_SHIFT_CONFIG.targetSheetName);
+  const range = targetSheet.getRange(1, EL_SHIFT_CONFIG.targetMemberColumn, targetSheet.getLastRow(), 1);
+  const displayValues = range.getDisplayValues();
+  const formulas = range.getFormulas();
+
+  for (let row = 0; row < displayValues.length; row++) {
+    const displayText = displayValues[row][0];
+    const formulaText = formulas[row][0];
+    const cwId = elShiftExtractCwIdFromElCell_(displayText, formulaText);
+
+    if (cwId) {
+      Logger.log(
+        `EL row=${row + 1}, CW_ID=${cwId}, display="${displayText}", formula="${formulaText}"`
+      );
+    }
+  }
+}
+
+function elShiftReadStatusSetting_(sheet) {
+  const values = sheet.getDataRange().getDisplayValues();
+  const result = {};
+
+  for (let row = EL_SHIFT_CONFIG.shiftSettingStartRow - 1; row < values.length; row++) {
+    const status = elShiftCleanText_(values[row][EL_SHIFT_CONFIG.shiftSettingStatusColumn - 1]);
+    const workingText = elShiftCleanText_(values[row][EL_SHIFT_CONFIG.shiftSettingWorkingColumn - 1]);
+
+    if (!status) continue;
+    result[status] = workingText.toUpperCase() === 'TRUE';
+  }
+
+  return result;
+}
+
+function elShiftReadMemberData_(sheet) {
+  const values = sheet.getDataRange().getDisplayValues();
+  const header = values[EL_SHIFT_CONFIG.masterHeaderRow - 1].map(elShiftCleanHeader_);
+
+  const cwIdColumn =
+    EL_SHIFT_CONFIG.masterCwIdColumn ||
+    elShiftFindHeaderColumn_(header, ['CW_ID', 'CW ID', 'CWID', 'CHATWORK ID', 'チャットワークID']);
+
+  const overseasNameColumn =
+    EL_SHIFT_CONFIG.masterOverseasNameColumn ||
+    elShiftFindHeaderColumn_(header, [
+      '海外表姓名',
+      '海外シフト名',
+      '海外シフト名前',
+      '海外シフト表名',
+      '海外表名前',
+      '海外名',
+      'シフト表名前',
+      'シフト表名',
+      '表示名',
+      '名前',
+      '氏名',
+      '姓名',
+    ]);
+
+  if (!cwIdColumn || !overseasNameColumn) {
+    throw new Error('Cannot find CW_ID column or overseas name column in メンバーデータ.');
+  }
+
+  const result = {};
+
+  for (let row = EL_SHIFT_CONFIG.masterHeaderRow; row < values.length; row++) {
+    const cwId = elShiftExtractCwId_(values[row][cwIdColumn - 1]) || elShiftCleanText_(values[row][cwIdColumn - 1]);
+    const overseasName = elShiftDisplayText_(values[row][overseasNameColumn - 1]);
+
+    if (cwId && overseasName) {
+      if (result[cwId] && result[cwId] !== overseasName) {
+        Logger.log(`WARNING: メンバーデータ内でCW_IDが重複しています。CW_ID=${cwId}, name1=${result[cwId]}, name2=${overseasName}`);
+      }
+
+      result[cwId] = overseasName;
+    }
+  }
+
+  return result;
+}
+
+function elShiftBuildOverseasNameIndex_(sourceValues) {
+  const result = {};
+
+  sourceValues.forEach((row, index) => {
+    const name = elShiftNormalizeName_(row[EL_SHIFT_CONFIG.sourceMemberNameColumn - 1]);
+    if (!name) return;
+
+    if (result[name]) {
+      Logger.log(
+        `WARNING: 海外表で同じ姓名が複数あります。name=${name}, rows=${result[name]}, ${index + 1}`
+      );
+    }
+
+    result[name] = index + 1;
+  });
+
+  return result;
+}
+
+function elShiftBuildDateIndex_(values, dateRowNumber, baseYear, baseMonth) {
+  const dateRow = values[dateRowNumber - 1];
+
+  const dayCells = dateRow
+    .map((cell, index) => ({
+      day: elShiftParseDay_(cell),
+      column: index + 1,
+    }))
+    .filter((item) => item.day);
+
+  const firstDayOneIndex = Math.max(0, dayCells.findIndex((item) => item.day === 1));
+  const secondDayOneIndex = dayCells.findIndex(
+    (item, index) => index > firstDayOneIndex && item.day === 1
+  );
+
+  const result = {};
+
+  dayCells.forEach((item, index) => {
+    let monthOffset = 0;
+
+    if (index < firstDayOneIndex) monthOffset = -1;
+    if (secondDayOneIndex !== -1 && index >= secondDayOneIndex) monthOffset = 1;
+
+    const date = new Date(baseYear, baseMonth - 1 + monthOffset, item.day);
+    const dateKey = elShiftDateKey_(date.getFullYear(), date.getMonth() + 1, date.getDate());
+    result[dateKey] = item.column;
+  });
+
+  return result;
+}
+
+// ルール:
+//  海外表が空白 => 休
+//  有/特/代/公休 など勤務ではないステータス => 休
+//  前/前R/前大 など => 前
+//  後/後R/後大 など => 後
+//  A/R/入社/大/CX部/TL/STL など勤務扱い => 空白
+
+function elShiftConvertStatus_(overseasStatus, statusIsWorking) {
+  if (!overseasStatus) {
+    return {
+      value: '休',
+      reason: '海外状態が空白のため休',
+      unknownStatus: false,
+    };
+  }
+
+  if (!Object.prototype.hasOwnProperty.call(statusIsWorking, overseasStatus)) {
+    Logger.log(`WARNING: 未定義ステータスです。status="${overseasStatus}"`);
+
+    return {
+      value: '',
+      reason: `未定義ステータスのため空白扱い: ${overseasStatus}`,
+      unknownStatus: true,
+    };
+  }
+
+  if (statusIsWorking[overseasStatus] === false) {
+    return {
+      value: '休',
+      reason: `非勤務ステータスのため休: ${overseasStatus}`,
+      unknownStatus: false,
+    };
+  }
+
+  if (overseasStatus.indexOf('前') === 0) {
+    return {
+      value: '前',
+      reason: `前シフトのため前: ${overseasStatus}`,
+      unknownStatus: false,
+    };
+  }
+
+  if (overseasStatus.indexOf('後') === 0) {
+    return {
+      value: '後',
+      reason: `後シフトのため後: ${overseasStatus}`,
+      unknownStatus: false,
+    };
+  }
+
+  return {
+    value: '',
+    reason: `勤務扱いのため空白: ${overseasStatus}`,
+    unknownStatus: false,
+  };
+}
+
+function elShiftGetTargetDates_() {
+  const lastDay = new Date(EL_SHIFT_CONFIG.targetYear, EL_SHIFT_CONFIG.targetMonth, 0).getDate();
+  const result = [];
+
+  for (let day = 1; day <= lastDay; day++) {
+    result.push(elShiftDateKey_(EL_SHIFT_CONFIG.targetYear, EL_SHIFT_CONFIG.targetMonth, day));
+  }
+
+  return result;
+}
+
+function elShiftShouldTestThisDate_(dateKey) {
+  if (EL_SHIFT_CONFIG.mode === 'EXECUTE') return true;
+  if (!EL_SHIFT_CONFIG.testDate) return true;
+  return dateKey === elShiftNormalizeDateKey_(EL_SHIFT_CONFIG.testDate);
+}
+
+function elShiftShouldTestThisMember_(cwId) {
+  if (EL_SHIFT_CONFIG.mode === 'EXECUTE') return true;
+  if (!EL_SHIFT_CONFIG.testCwId) return true;
+  return cwId === String(EL_SHIFT_CONFIG.testCwId);
+}
+
+function elShiftOpenSpreadsheet_(spreadsheetId) {
+  if (spreadsheetId) return SpreadsheetApp.openById(spreadsheetId);
+  return SpreadsheetApp.getActiveSpreadsheet();
+}
+
+function elShiftGetSheet_(spreadsheet, sheetName) {
+  const sheet = spreadsheet.getSheetByName(sheetName);
+  if (!sheet) throw new Error(`Sheet not found: ${sheetName}`);
+  return sheet;
+}
+
+function elShiftValidateMode_() {
+  const allowedModes = ['DRY_RUN', 'TEST_ONE', 'EXECUTE'];
+  if (allowedModes.indexOf(EL_SHIFT_CONFIG.mode) === -1) {
+    throw new Error(`mode must be one of: ${allowedModes.join(', ')}`);
+  }
+}
+
+function elShiftFindHeaderColumn_(headerRow, possibleNames) {
+  const possibleHeaders = possibleNames.map(elShiftCleanHeader_);
+  const index = headerRow.findIndex((header) => possibleHeaders.indexOf(header) !== -1);
+  return index === -1 ? null : index + 1;
+}
+
+function elShiftExtractCwId_(text) {
+  const match = elShiftDisplayText_(text).match(/\[To:(\d+)\]/);
+  return match ? match[1] : '';
+}
+
+function elShiftExtractCwIdFromElCell_(displayText, formulaText) {
+  return elShiftExtractCwId_(displayText) || elShiftExtractCwId_(formulaText);
+}
+
+function elShiftParseYearMonth_(text) {
+  const value = elShiftDisplayText_(text);
+
+  let match = value.match(/(\d{4})年(\d{1,2})月/);
+  if (match) return { year: Number(match[1]), month: Number(match[2]) };
+
+  match = value.match(/^(\d{4})(\d{2})/);
+  if (match) return { year: Number(match[1]), month: Number(match[2]) };
+
+  return null;
+}
+
+function elShiftParseDay_(text) {
+  const match = elShiftDisplayText_(text).match(/^(\d{1,2})/);
+  if (!match) return null;
+
+  const day = Number(match[1]);
+  return day >= 1 && day <= 31 ? day : null;
+}
+
+function elShiftNormalizeDateKey_(text) {
+  const value = elShiftDisplayText_(text);
+  const match = value.match(/^(\d{4})[-/](\d{1,2})[-/](\d{1,2})$/);
+
+  if (!match) return value;
+
+  return elShiftDateKey_(Number(match[1]), Number(match[2]), Number(match[3]));
+}
+
+function elShiftDateKey_(year, month, day) {
+  return `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+}
+
+function elShiftColumnToLetter_(columnNumber) {
+  let result = '';
+  let number = columnNumber;
+
+  while (number > 0) {
+    const remainder = (number - 1) % 26;
+    result = String.fromCharCode(65 + remainder) + result;
+    number = Math.floor((number - 1) / 26);
+  }
+
+  return result;
+}
+
+function elShiftToSet_(values) {
+  const result = {};
+
+  values.forEach((value) => {
+    result[elShiftCleanText_(value)] = true;
+  });
+
+  return result;
+}
+
+function elShiftDisplayText_(value) {
+  return String(value == null ? '' : value).normalize('NFKC').trim();
+}
+
+function elShiftCleanText_(value) {
+  return elShiftDisplayText_(value).replace(/\s+/g, '');
+}
+
+function elShiftCleanHeader_(value) {
+  return elShiftCleanText_(value).toUpperCase();
+}
+
+function elShiftNormalizeName_(value) {
+  return elShiftDisplayText_(value).replace(/\s+/g, '');
+}
+
+function elShiftLogDuplicateCwIds_(targetValues, targetFormulas) {
+  const cwIdToRows = {};
+
+  for (let rowIndex = 0; rowIndex < targetValues.length; rowIndex++) {
+    const displayText = targetValues[rowIndex][EL_SHIFT_CONFIG.targetMemberColumn - 1];
+    const formulaText = targetFormulas[rowIndex][EL_SHIFT_CONFIG.targetMemberColumn - 1];
+    const cwId = elShiftExtractCwIdFromElCell_(displayText, formulaText);
+
+    if (!cwId) continue;
+
+    if (!cwIdToRows[cwId]) {
+      cwIdToRows[cwId] = [];
+    }
+
+    cwIdToRows[cwId].push(rowIndex + 1);
+  }
+
+  Object.keys(cwIdToRows).forEach((cwId) => {
+    if (cwIdToRows[cwId].length > 1) {
+      Logger.log(`WARNING: EL表でCW_IDが重複しています。CW_ID=${cwId}, EL rows=${cwIdToRows[cwId].join(', ')}`);
+    }
+  });
+}
+
+function elShiftLogDuplicateOverseasNames_(sourceValues) {
+  const nameToRows = {};
+
+  sourceValues.forEach((row, index) => {
+    const name = elShiftNormalizeName_(row[EL_SHIFT_CONFIG.sourceMemberNameColumn - 1]);
+    if (!name) return;
+
+    if (!nameToRows[name]) {
+      nameToRows[name] = [];
+    }
+
+    nameToRows[name].push(index + 1);
+  });
+
+  Object.keys(nameToRows).forEach((name) => {
+    if (nameToRows[name].length > 1) {
+      Logger.log(`WARNING: 海外表で姓名が重複しています。name=${name}, rows=${nameToRows[name].join(', ')}`);
+    }
+  });
+}
+
+//海外表の日付行を自動検出して、対象月の日付列を作成する。
+
+function elShiftBuildSourceDateIndexAuto_(values, baseYear, baseMonth, minColumn) {
+  const lastDay = new Date(baseYear, baseMonth, 0).getDate();
+
+  let bestCandidate = null;
+
+  for (let rowIndex = 0; rowIndex < values.length; rowIndex++) {
+    const row = values[rowIndex];
+
+    for (let colIndex = minColumn - 1; colIndex < row.length; colIndex++) {
+      const firstDay = elShiftParseDayStrict_(row[colIndex]);
+
+      if (firstDay !== 1) continue;
+
+      let matchedDays = 0;
+
+      for (let day = 1; day <= lastDay; day++) {
+        const checkColIndex = colIndex + day - 1;
+
+        if (checkColIndex >= row.length) break;
+
+        const parsedDay = elShiftParseDayStrict_(row[checkColIndex]);
+
+        if (parsedDay === day) {
+          matchedDays++;
+        } else {
+          break;
+        }
+      }
+
+      if (!bestCandidate || matchedDays > bestCandidate.matchedDays) {
+        bestCandidate = {
+          rowNumber: rowIndex + 1,
+          startColumn: colIndex + 1,
+          matchedDays: matchedDays,
+        };
+      }
+    }
+  }
+
+  if (!bestCandidate || bestCandidate.matchedDays < 20) {
+    throw new Error(
+      `Cannot auto-detect source date row. ` +
+      `year=${baseYear}, month=${baseMonth}, matchedDays=${bestCandidate ? bestCandidate.matchedDays : 0}`
+    );
+  }
+
+  const result = {};
+
+  for (let day = 1; day <= lastDay; day++) {
+    const dateKey = elShiftDateKey_(baseYear, baseMonth, day);
+    result[dateKey] = bestCandidate.startColumn + day - 1;
+  }
+
+  Logger.log(
+    `SOURCE DATE ROW AUTO-DETECTED: row=${bestCandidate.rowNumber}, ` +
+    `startColumn=${elShiftColumnToLetter_(bestCandidate.startColumn)}, ` +
+    `matchedDays=${bestCandidate.matchedDays}`
+  );
+
+  Logger.log(
+    `SOURCE DATE CHECK: ` +
+    `2026-08-01=${elShiftColumnToLetter_(result['2026-08-01'])}, ` +
+    `2026-08-19=${elShiftColumnToLetter_(result['2026-08-19'])}, ` +
+    `2026-08-31=${elShiftColumnToLetter_(result['2026-08-31'])}`
+  );
+
+  return result;
+}
+
+//日付行判定用
+function elShiftParseDayStrict_(value) {
+  const text = elShiftDisplayText_(value);
+
+  if (!text) return null;
+
+  const match = text.match(/^(\d{1,2})(?:\s|\(|（|$)/);
+  if (!match) return null;
+
+  const day = Number(match[1]);
+
+  return day >= 1 && day <= 31 ? day : null;
+}
