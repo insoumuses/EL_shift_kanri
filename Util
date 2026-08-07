@@ -1,192 +1,169 @@
+/*************************************************
+ * 最終営業日
+ *************************************************/
+
 /**
- * 指定日が、その月の最終営業日かどうかを判定する。
+ * 指定日がその月の最終営業日か
  */
-function elShiftIsLastBusinessDay_(date) {
-  const targetDateKey = elShiftDateKey_(
+function isLastBusinessDay_(date = new Date()) {
+  const lastBusinessDay = getLastBusinessDay_(
+    date.getFullYear(),
+    date.getMonth() + 1
+  );
+
+  const todayKey = dateKey_(
     date.getFullYear(),
     date.getMonth() + 1,
     date.getDate()
   );
 
-  const lastBusinessDay = elShiftGetLastBusinessDayOfMonth_(
-    date.getFullYear(),
-    date.getMonth() + 1
-  );
-
-  const lastBusinessDayKey = elShiftDateKey_(
+  const lastKey = dateKey_(
     lastBusinessDay.getFullYear(),
     lastBusinessDay.getMonth() + 1,
     lastBusinessDay.getDate()
   );
 
   Logger.log(
-    `LAST BUSINESS DAY CHECK: today=${targetDateKey}, lastBusinessDay=${lastBusinessDayKey}`
+    `LAST BUSINESS DAY CHECK: today=${todayKey}, last=${lastKey}`
   );
 
-  return targetDateKey === lastBusinessDayKey;
+  return todayKey === lastKey;
 }
 
-/**
- * 指定年月の最終営業日を取得する。
- */
-function elShiftGetLastBusinessDayOfMonth_(year, month) {
-  let date = new Date(year, month, 0);
 
-  while (!elShiftIsBusinessDay_(date)) {
+/**
+ * 指定年月の最終営業日を取得
+ */
+function getLastBusinessDay_(year, month) {
+  const holidays = getHolidaySet_();
+
+  const date = new Date(year, month, 0);
+
+  while (!isBusinessDay_(date, holidays)) {
     date.setDate(date.getDate() - 1);
   }
 
   return date;
 }
 
+
 /**
- * 営業日判定。
- *
- * 営業日：
- * - 土曜ではない
- * - 日曜ではない
- * - 休日データ Sheet に登録されている日付ではない
+ * 土日・休日データを除外
  */
-function elShiftIsBusinessDay_(date) {
+function isBusinessDay_(date, holidays) {
   const day = date.getDay();
 
-  // 0 = Sunday, 6 = Saturday
+  // 日曜 / 土曜
   if (day === 0 || day === 6) {
     return false;
   }
 
-  if (elShiftIsHolidayFromSheet_(date)) {
-    return false;
-  }
-
-  return true;
+  return !holidays.has(
+    dateKey_(
+      date.getFullYear(),
+      date.getMonth() + 1,
+      date.getDate()
+    )
+  );
 }
 
-/**
- * 休日データ Sheet を参照して祝日・会社休日を判定する。
- *
- * 対応できる形式：
- * - 2026/07/20
- * - 2026-07-20
- * - Date型の日付セル
- *
- * Sheet内のどの列に日付があっても拾えるように、
- * 全セルを走査して日付らしい値を判定する。
- */
-function elShiftIsHolidayFromSheet_(date) {
-  const holidayDateSet = elShiftGetHolidayDateSet_();
 
-  const dateKey = elShiftDateKey_(
-    date.getFullYear(),
-    date.getMonth() + 1,
-    date.getDate()
-  );
-
-  return !!holidayDateSet[dateKey];
-}
+/*************************************************
+ * 休日データ
+ *************************************************/
 
 /**
- * 休日データ Sheet から休日一覧を取得する。
- *
- * Sheet名：休日データ
+ * 「休日データ」Sheetから休日一覧を取得
  */
-function elShiftGetHolidayDateSet_() {
-  const spreadsheet = elShiftOpenSpreadsheet_(
-    EL_SHIFT_CONFIG.settingSpreadsheetId ||
-    EL_SHIFT_CONFIG.targetSpreadsheetId ||
-    ''
-  );
+function getHolidaySet_() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
 
-  const sheet = spreadsheet.getSheetByName('休日データ');
+  const sheet = ss.getSheetByName('休日データ');
 
   if (!sheet) {
-    throw new Error('Sheet not found: 休日データ');
+    throw new Error('シートが見つかりません: 休日データ');
   }
 
   const values = sheet.getDataRange().getValues();
-  const result = {};
+  const holidays = new Set();
 
-  values.forEach((row) => {
-    row.forEach((cell) => {
-      const dateKey = elShiftParseHolidayDateKey_(cell);
+  values.flat().forEach(value => {
+    const key = parseHolidayDate_(value);
 
-      if (dateKey) {
-        result[dateKey] = true;
-      }
-    });
+    if (key) {
+      holidays.add(key);
+    }
   });
 
   Logger.log(
-    `HOLIDAY DATA LOADED: ${Object.keys(result).length} dates from 休日データ`
+    `HOLIDAY DATA: ${holidays.size}件`
   );
 
-  return result;
+  return holidays;
 }
 
+
 /**
- * 休日データ Sheet のセル値を yyyy-mm-dd に変換する。
+ * 休日データ → YYYY-MM-DD
+ *
+ * 対応：
+ * Date
+ * 2026/08/11
+ * 2026-08-11
+ * 2026年8月11日
  */
-function elShiftParseHolidayDateKey_(value) {
-  if (value instanceof Date && !isNaN(value.getTime())) {
-    return elShiftDateKey_(
+function parseHolidayDate_(value) {
+  if (
+    value instanceof Date &&
+    !isNaN(value.getTime())
+  ) {
+    return dateKey_(
       value.getFullYear(),
       value.getMonth() + 1,
       value.getDate()
     );
   }
 
-  const text = elShiftDisplayText_(value);
+  const text = String(value || '')
+    .normalize('NFKC')
+    .trim();
 
-  if (!text) return '';
-
-  let match = text.match(/^(\d{4})[\/\-](\d{1,2})[\/\-](\d{1,2})$/);
-  if (match) {
-    return elShiftDateKey_(
-      Number(match[1]),
-      Number(match[2]),
-      Number(match[3])
-    );
+  if (!text) {
+    return '';
   }
 
-  match = text.match(/^(\d{4})年(\d{1,2})月(\d{1,2})日$/);
-  if (match) {
-    return elShiftDateKey_(
-      Number(match[1]),
-      Number(match[2]),
-      Number(match[3])
-    );
+  const match = text.match(
+    /^(\d{4})(?:[/-]|年)(\d{1,2})(?:[/-]|月)(\d{1,2})日?$/
+  );
+
+  if (!match) {
+    return '';
   }
 
-  return '';
-}
-
-/**
- * ログ用日付表示。
- */
-function elShiftFormatDateForLog_(date) {
-  return elShiftDateKey_(
-    date.getFullYear(),
-    date.getMonth() + 1,
-    date.getDate()
+  return dateKey_(
+    Number(match[1]),
+    Number(match[2]),
+    Number(match[3])
   );
 }
 
-/**
- * 最終営業日の判定確認用。
- * 必要に応じて year / month を書き換えて実行してください。
- */
+
+/*************************************************
+ * Debug
+ *************************************************/
+
 function debugLastBusinessDay() {
   const year = 2026;
-  const month = 7;
+  const month = 8;
 
-  const date = elShiftGetLastBusinessDayOfMonth_(year, month);
+  const date = getLastBusinessDay_(year, month);
 
   Logger.log(
     `${year}年${month}月の最終営業日: ` +
-      elShiftDateKey_(
-        date.getFullYear(),
-        date.getMonth() + 1,
-        date.getDate()
-      )
+    dateKey_(
+      date.getFullYear(),
+      date.getMonth() + 1,
+      date.getDate()
+    )
   );
 }
